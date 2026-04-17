@@ -21,6 +21,7 @@ func main() {
 	cmds.register("login", handlerLogin)
 	cmds.register("register", handlerRegister)
 	cmds.register("reset", handlerReset)
+	cmds.register("users", handlerUsers)
 
 	//DB Handling
 	db, err := sql.Open("postgres", s.cfg.DbUrl)
