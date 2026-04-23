@@ -2,15 +2,21 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"html"
 	"io"
+	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Fullmetalfan2012/Gator/internal/database"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 type RSSFeed struct {
@@ -63,13 +69,99 @@ func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 	return &feed, nil
 }
 
-func handlerAgg(s *state, cmd command) error {
-	feed, err := fetchFeed(context.Background(), "https://www.wagslane.dev/index.xml")
+func scrapeFeeds(s *state) {
+	feed, err := s.db.GetNextFeedToFetch(context.Background())
 	if err != nil {
-		return fmt.Errorf("error fetching feed: %w", err)
+		fmt.Printf("error getting next feed: %v\n", err)
+		return
 	}
-	fmt.Printf("%+v\n", feed)
-	return nil
+
+	err = s.db.MarkFeedFetched(context.Background(), feed.ID)
+	if err != nil {
+		fmt.Printf("error marking feed fetched: %v\n", err)
+		return
+	}
+
+	rssFeed, err := fetchFeed(context.Background(), feed.Url)
+	if err != nil {
+		fmt.Printf("error fetching feed %s: %v\n", feed.Url, err)
+		return
+	}
+
+	fmt.Printf("Feed: %s\n", feed.Name)
+	for _, item := range rssFeed.Channel.Item {
+		publishedAt := sql.NullTime{}
+		if t, err := parsePubDate(item.PubDate); err == nil {
+			publishedAt = sql.NullTime{Time: t, Valid: true}
+		}
+
+		description := sql.NullString{}
+		if item.Description != "" {
+			description = sql.NullString{String: item.Description, Valid: true}
+		}
+
+		now := time.Now()
+		_, err := s.db.CreatePost(context.Background(), database.CreatePostParams{
+			ID:          uuid.New(),
+			CreatedAt:   now,
+			UpdatedAt:   now,
+			Title:       item.Title,
+			Url:         item.Link,
+			Description: description,
+			PublishedAt: publishedAt,
+			FeedID:      feed.ID,
+		})
+		if err != nil {
+			var pqErr *pq.Error
+			if errors.As(err, &pqErr) && pqErr.Code == "23505" {
+				continue
+			}
+			log.Printf("error saving post %q: %v", item.Link, err)
+		}
+	}
+}
+
+func parsePubDate(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, fmt.Errorf("empty pubDate")
+	}
+	layouts := []string{
+		time.RFC1123Z,
+		time.RFC1123,
+		time.RFC822Z,
+		time.RFC822,
+		time.RFC3339,
+		time.RFC3339Nano,
+		"Mon, 2 Jan 2006 15:04:05 -0700",
+		"Mon, 2 Jan 2006 15:04:05 MST",
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unrecognized pubDate format: %q", s)
+}
+
+func handlerAgg(s *state, cmd command) error {
+	if len(cmd.args) != 1 {
+		return fmt.Errorf("agg requires one argument: time_between_reqs")
+	}
+
+	timeBetweenRequests, err := time.ParseDuration(cmd.args[0])
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", cmd.args[0], err)
+	}
+
+	fmt.Printf("Collecting feeds every %v\n", timeBetweenRequests)
+
+	ticker := time.NewTicker(timeBetweenRequests)
+	for ; ; <-ticker.C {
+		scrapeFeeds(s)
+	}
 }
 
 func createFeedFollow(s *state, userID, feedID uuid.UUID) (database.CreateFeedFollowRow, error) {
@@ -169,6 +261,45 @@ func handlerUnfollow(s *state, cmd command, user database.User) error {
 		return fmt.Errorf("error unfollowing feed: %w", err)
 	}
 	fmt.Printf("Unfollowed %s\n", cmd.args[0])
+	return nil
+}
+
+func handlerBrowse(s *state, cmd command, user database.User) error {
+	limit := int32(2)
+	if len(cmd.args) >= 1 {
+		n, err := strconv.ParseInt(cmd.args[0], 10, 32)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("invalid limit %q: must be a positive integer", cmd.args[0])
+		}
+		limit = int32(n)
+	}
+
+	posts, err := s.db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
+		UserID: user.ID,
+		Limit:  limit,
+	})
+	if err != nil {
+		return fmt.Errorf("error fetching posts: %w", err)
+	}
+
+	if len(posts) == 0 {
+		fmt.Println("No posts found. Try running `agg` to fetch some!")
+		return nil
+	}
+
+	for _, p := range posts {
+		published := "(unknown)"
+		if p.PublishedAt.Valid {
+			published = p.PublishedAt.Time.Format(time.RFC1123)
+		}
+		fmt.Printf("=== %s ===\n", p.Title)
+		fmt.Printf("Published: %s\n", published)
+		fmt.Printf("URL:       %s\n", p.Url)
+		if p.Description.Valid && p.Description.String != "" {
+			fmt.Printf("%s\n", p.Description.String)
+		}
+		fmt.Println()
+	}
 	return nil
 }
 
